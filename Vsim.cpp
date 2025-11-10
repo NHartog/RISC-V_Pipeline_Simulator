@@ -252,22 +252,22 @@ public:
     deque<unique_ptr<Instruction>> bufferedPreALU1Queue;
     deque<unique_ptr<Instruction>> bufferedPreALU2Queue;
     deque<unique_ptr<Instruction>> bufferedPreALU3Queue;
-    deque<unique_ptr<Instruction>> bufferedPreMemQueue;
 
-    deque<unique_ptr<Instruction>> bufferedPostMemQueue;
-    deque<unique_ptr<Instruction>> bufferedPostALU2Queue;
-    deque<unique_ptr<Instruction>> bufferedPostALU3Queue;
+    deque<pair<unique_ptr<Instruction>, int>>    bufferedPreMemQueue;
+    deque<pair<unique_ptr<Instruction>, pair<int, int>>> bufferedPostMemQueue;
+    deque<pair<unique_ptr<Instruction>, int>>    bufferedPostALU2Queue;
+    deque<pair<unique_ptr<Instruction>, int>>    bufferedPostALU3Queue;
 
     deque<unique_ptr<Instruction>>    preIssueQueue;
 
     deque<unique_ptr<Instruction>>    preALU1Queue;
     deque<unique_ptr<Instruction>>    preALU2Queue;
     deque<unique_ptr<Instruction>>    preALU3Queue;
-    deque<unique_ptr<Instruction>>    preMemQueue;
 
-    deque<unique_ptr<Instruction>>    postMemQueue;
-    deque<unique_ptr<Instruction>>    postALU2Queue;
-    deque<unique_ptr<Instruction>>    postALU3Queue;
+    deque<pair<unique_ptr<Instruction>, int>>    preMemQueue;
+    deque<pair<unique_ptr<Instruction>, pair<int, int>>>    postMemQueue;
+    deque<pair<unique_ptr<Instruction>, int>>    postALU2Queue;
+    deque<pair<unique_ptr<Instruction>, int>>    postALU3Queue;
 
     unique_ptr<Instruction>           IFwaiting;
     unique_ptr<Instruction>           IFexecuted;
@@ -628,7 +628,9 @@ void IF(){
                 int rs2 = (int) cat1->bits.rs2.to_ulong();
                 bitset<12> mem = bitset<12>(cat1->bits.imm115.to_string() + cat1->bits.imm40.to_string());
 
-                if (OPCODES_1[cat1->bits.opcode.to_string()] == "beq" or "bne" or "blt") {
+                if (OPCODES_1[cat1->bits.opcode.to_string()] == "beq" or
+                    OPCODES_1[cat1->bits.opcode.to_string()] == "bne" or
+                    OPCODES_1[cat1->bits.opcode.to_string()] == "blt") {
                     if (registerState[rs1] == FREE && registerState[rs2] == FREE) {
                         if (OPCODES_1[cat1->bits.opcode.to_string()] == "beq") {
                             if (registers[rs1] == registers[rs2]) {
@@ -711,25 +713,85 @@ void IF(){
 
 
 void Isssue(){
-    for(auto& inst : Program::instance().preIssueQueue){
+    auto registerState= Program::instance().getRegisterRoles();
+
+    for(auto &inst : Program::instance().preIssueQueue){
         switch ((inst->category())) {
             case Instruction::Category::CAT1: {
-                auto cat1 = (Cat1Instruction *) (instruction[(programCounter - 256) / 4]).get();
+                auto cat1 = (Cat1Instruction *)(inst.get());
                 int rs1 = (int)cat1->bits.rs1.to_ulong();
                 int rs2 = (int)cat1->bits.rs2.to_ulong();
                 bitset<12> mem = bitset<12>(cat1->bits.imm115.to_string() + cat1->bits.imm40.to_string());
 
+                if (OPCODES_1[cat1->bits.opcode.to_string()] == "sw" &&
+                    registerState[rs1] == FREE && registerState[rs2] == FREE) {
+                    Program::instance().bufferedPreALU1Queue.push_back(unique_ptr<Instruction>(cat1));
+                    Program::instance().preIssueQueue.pop_front();
+                    registerState[rs1] = SOURCE;
+                    registerState[rs2] = SOURCE;
+                }
                 break;
             }
             case Instruction::Category::CAT2: {
+                auto cat2 = (Cat2Instruction *)(inst.get());
+                int rs1 = (int)cat2->bits.rs1.to_ulong();
+                int rs2 = (int)cat2->bits.rs2.to_ulong();
+                int rd =  (int)cat2->bits.rd.to_ulong();
+
+                if ((OPCODES_2[cat2->bits.opcode.to_string()] == "add" || OPCODES_2[cat2->bits.opcode.to_string()] == "sub")&&
+                    registerState[rs1] == FREE && registerState[rs2] == FREE && registerState[rd] == FREE) {
+                    Program::instance().bufferedPreALU2Queue.push_back(unique_ptr<Instruction>(cat2));
+                    Program::instance().preIssueQueue.pop_front();
+                    registerState[rs1] = SOURCE;
+                    registerState[rs2] = SOURCE;
+                    registerState[rd] = DESTINATION;
+                }
+                else if ((OPCODES_2[cat2->bits.opcode.to_string()] == "or")&&
+                    registerState[rs1] == FREE && registerState[rs2] == FREE && registerState[rd] == FREE) {
+                    Program::instance().bufferedPreALU3Queue.push_back(unique_ptr<Instruction>(cat2));
+                    Program::instance().preIssueQueue.pop_front();
+                    registerState[rs1] = SOURCE;
+                    registerState[rs2] = SOURCE;
+                    registerState[rd] = DESTINATION;
+                }
+
                 break;
             }
             case Instruction::Category::CAT3: {
+                auto cat3 = (Cat3Instruction *)(inst.get());
+                int rs1 = (int)cat3->bits.rs1.to_ulong();
+                int rd = (int)cat3->bits.rd.to_ulong();
+                int imm =  singedImm(cat3->bits.imm110.to_ulong(), cat3->bits.imm110.size());
+
+                if ((OPCODES_3[cat3->bits.opcode.to_string()] == "addi")&&
+                    registerState[rs1] == FREE && registerState[rd] == FREE) {
+                    Program::instance().bufferedPreALU2Queue.push_back(unique_ptr<Instruction>(cat3));
+                    Program::instance().preIssueQueue.pop_front();
+                    registerState[rs1] = SOURCE;
+                    registerState[rd] = DESTINATION;
+                }
+                else if ((OPCODES_3[cat3->bits.opcode.to_string()] == "andi" || OPCODES_3[cat3->bits.opcode.to_string()] == "ori"
+                    || OPCODES_3[cat3->bits.opcode.to_string()] == "slli" || OPCODES_3[cat3->bits.opcode.to_string()] == "srai") && registerState[rs1] == FREE
+                    && registerState[rs1] == FREE && registerState[rd]  == FREE) {
+                    Program::instance().bufferedPreALU3Queue.push_back(unique_ptr<Instruction>(cat3));
+                    Program::instance().preIssueQueue.pop_front();
+                    registerState[rs1] = SOURCE;
+                    registerState[rd] = DESTINATION;
+                }
+                else if ((OPCODES_3[cat3->bits.opcode.to_string()] == "lw")&&
+                    registerState[rs1] == FREE && registerState[rd] == FREE ) {
+                    Program::instance().bufferedPreALU1Queue.push_back(unique_ptr<Instruction>(cat3));
+                    Program::instance().preIssueQueue.pop_front();
+                    registerState[rs1] = SOURCE;
+                    registerState[rd] = DESTINATION;
+                }
+
                 break;
             }
             case Instruction::Category::CAT4: {
                 break;
             }
+
         }
     }
 }
@@ -739,19 +801,156 @@ void ALU(){
 }
 
 void ALU1(){
+    auto &inst = Program::instance().preALU1Queue.front();
+    auto &instruction = Program::instance().getInstructions();
+    auto &registers = Program::instance().getRegisters();
+    auto &memory = Program::instance().getMemory();
 
+    switch (inst.get()->category()) {
+        case Instruction::Category::CAT1: {
+            auto cat1 = (Cat1Instruction *) (inst.get());
+            int rs1 = (int)cat1->bits.rs1.to_ulong();
+            int rs2 = (int)cat1->bits.rs2.to_ulong();
+            int memToModify;
+            bitset<12> mem = bitset<12>(cat1->bits.imm115.to_string() + cat1->bits.imm40.to_string());
+
+            if (OPCODES_1[cat1->bits.opcode.to_string()] == "sw") {
+                int memToModify = mem.to_ulong() + registers[rs2];
+                Program::instance().bufferedPreMemQueue.emplace_back(cat1, memToModify);
+                Program::instance().preALU1Queue.pop_front();
+            }
+            break;
+        }
+        case Instruction::Category::CAT3: {
+            auto cat3 = (Cat3Instruction *) (inst.get());
+            int rs1 = (int)cat3->bits.rs1.to_ulong();
+            int rd = (int)cat3->bits.rd.to_ulong();
+            int imm =  singedImm(cat3->bits.imm110.to_ulong(), cat3->bits.imm110.size());
+
+            if (OPCODES_3[cat3->bits.opcode.to_string()] == "lw") {
+                int memToModify = imm + registers[rs1];
+                Program::instance().bufferedPreMemQueue.emplace_back(cat3, memToModify);
+                Program::instance().preALU1Queue.pop_front();
+            }
+            break;
+        }
+    }
 }
 
 void ALU2(){
+    auto &inst = Program::instance().preALU2Queue.front();
+    auto &instruction = Program::instance().getInstructions();
+    auto &registers = Program::instance().getRegisters();
+    auto &memory = Program::instance().getMemory();
 
+    switch ((inst->category())) {
+        case Instruction::Category::CAT2: {
+            auto cat2 = (Cat2Instruction *)(inst.get());
+            int rs1 = (int)cat2->bits.rs1.to_ulong();
+            int rs2 = (int)cat2->bits.rs2.to_ulong();
+            int result;
+
+            if (OPCODES_2[cat2->bits.opcode.to_string()] == "add") {
+                result = registers[rs1] + registers[rs2];
+            }
+            else if (OPCODES_2[cat2->bits.opcode.to_string()] == "sub") {
+                result = registers[rs1] - registers[rs2];
+            }
+            Program::instance().bufferedPostALU2Queue.emplace_back(cat2, result);
+            Program::instance().preALU2Queue.pop_front();
+
+            break;
+        }
+        case Instruction::Category::CAT3: {
+            auto cat3 = (Cat3Instruction *)(inst.get());
+            int rs1 = (int)cat3->bits.rs1.to_ulong();
+            int rd = (int)cat3->bits.rd.to_ulong();
+            int imm =  singedImm(cat3->bits.imm110.to_ulong(), cat3->bits.imm110.size());
+
+            if (OPCODES_3[cat3->bits.opcode.to_string()] == "addi") {
+                int result = registers[rs1] + imm;
+                Program::instance().bufferedPostALU3Queue.emplace_back(cat3, result);
+                Program::instance().preALU2Queue.pop_front();
+            }
+
+            break;
+        }
+    }
 }
 
 void ALU3(){
+    auto &inst = Program::instance().preALU3Queue.front();
+    auto &instruction = Program::instance().getInstructions();
+    auto &registers = Program::instance().getRegisters();
+    auto &memory = Program::instance().getMemory();
 
+    switch ((inst->category())) {
+        case Instruction::Category::CAT2: {
+            auto cat2 = (Cat2Instruction *)(inst.get());
+            int rs1 = (int)cat2->bits.rs1.to_ulong();
+            int rs2 = (int)cat2->bits.rs2.to_ulong();
+            int result;
+
+            if (OPCODES_2[cat2->bits.opcode.to_string()] == "and") {
+                result = (int)(bitset<32>(registers[rs1]) & bitset<32>(registers[rs2])).to_ulong();
+            }
+            else if (OPCODES_2[cat2->bits.opcode.to_string()] == "or") {
+                result = (int)(bitset<32>(registers[rs1]) | bitset<32>(registers[rs2])).to_ulong();
+            }
+            Program::instance().bufferedPostALU2Queue.emplace_back(cat2, result);
+            Program::instance().preALU2Queue.pop_front();
+
+            break;
+        }
+        case Instruction::Category::CAT3: {
+            auto cat3 = (Cat3Instruction *)(inst.get());
+            int rs1 = (int)cat3->bits.rs1.to_ulong();
+            int rd = (int)cat3->bits.rd.to_ulong();
+            int imm =  singedImm(cat3->bits.imm110.to_ulong(), cat3->bits.imm110.size());
+            int result;
+
+            if (OPCODES_3[cat3->bits.opcode.to_string()] == "andi") {
+                result = (int)(bitset<32>(registers[rs1]) & bitset<32>(imm)).to_ulong();
+            }
+            else if (OPCODES_3[cat3->bits.opcode.to_string()] == "ori") {
+                result = (int)(bitset<32>(registers[rs1]) | bitset<32>(imm)).to_ulong();
+            }
+            else if (OPCODES_3[cat3->bits.opcode.to_string()] == "slli") {
+                result = (int)(bitset<32>(registers[rs1]) << imm).to_ulong();
+            }
+            else if (OPCODES_3[cat3->bits.opcode.to_string()] == "srai") {
+                result = (int)(bitset<32>(registers[rs1]) >> imm).to_ulong();
+            }
+            Program::instance().bufferedPostALU3Queue.emplace_back(cat3, result);
+            Program::instance().preALU3Queue.pop_front();
+            break;
+        }
+    }
 }
 
 void MEM(){
+    auto &inst = Program::instance().preMemQueue.front();
+    auto &instruction = Program::instance().getInstructions();
+    auto &registers = Program::instance().getRegisters();
+    auto &memory = Program::instance().getMemory();
 
+    switch ((inst.first->category())) {
+        case Instruction::Category::CAT1: {
+
+        }
+        case Instruction::Category::CAT3: {
+            auto cat3 = (Cat3Instruction*)inst.first.get();
+            int rs1 = (int)cat3->bits.rs1.to_ulong();
+            int rd = (int)cat3->bits.rd.to_ulong();
+            int imm =  singedImm(cat3->bits.imm110.to_ulong(), cat3->bits.imm110.size());
+            int location = inst.second;
+
+            int memValue = (int)Program::instance().getValueAtMem(location).to_ulong();
+
+            Program::instance().bufferedPostMemQueue.emplace_back(cat3, make_pair(location, memValue));
+
+        }
+    }
 }
 
 void WB(){
