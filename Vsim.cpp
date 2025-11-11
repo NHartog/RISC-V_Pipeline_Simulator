@@ -7,20 +7,23 @@
 #include <memory>
 #include <unordered_map>
 #include <queue>
+#include <unordered_set>
 /*
  * The code below was made before I saw we needed one to submit only 1 file
  * so there is an element of polymorphism here with Instruction class and
  * Program class. I liked how I had originally designed it so I stuck with it
  */
 
-#define PREISSUEMAX = 4
-#define PREALU1MAX = 2
-#define PREALU2MAX = 1
-#define PREALU3MAX = 1
-#define PREMEMMAX = 1
-#define POSTMEMMAX = 1
-#define POSTALU2MAX = 1
-#define POSTALU3MAX = 1
+// Fix these #defines (remove the '=')
+#define PREISSUEMAX 4
+#define PREALU1MAX  2
+#define PREALU2MAX  1
+#define PREALU3MAX  1
+#define PREMEMMAX   1
+#define POSTMEMMAX  1
+#define POSTALU2MAX 1
+#define POSTALU3MAX 1
+
 
 
 using namespace std;
@@ -455,242 +458,464 @@ void disassemble(ifstream& file) {
 
 // performs the logic for the instructions}
 
+// Helpers for Issue hazard catchng
+
+struct HazSnapshot {
+    // who will write? who is being read?
+    unordered_set<int> activeDests;   // regs that some in-flight instr will write
+    unordered_set<int> activeSources; // regs that some in-flight instr will read
+    bool olderStorePending = false;        // there exists a not-yet-issued older store
+};
+
+// returns rd for CAT2/CAT3 (non-lw/sw), or -1 if none
+static int getDestReg(const Instruction* ins) {
+    switch (ins->category()) {
+        case Instruction::Category::CAT2: {
+            auto* i = (const Cat2Instruction*)ins;
+            return (int)i->bits.rd.to_ulong();
+        }
+        case Instruction::Category::CAT3: {
+            auto* i = (const Cat3Instruction*)ins;
+            const string m = OPCODES_3[i->bits.opcode.to_string()];
+            if (m == "lw") return (int)i->bits.rd.to_ulong();
+            // addi/andi/ori/slli/srai write rd
+            return (int)i->bits.rd.to_ulong();
+        }
+        default: return -1;
+    }
+}
+
+static void addSources(const Instruction* ins, unordered_set<int>& S) {
+    switch (ins->category()) {
+        case Instruction::Category::CAT1: { // sw uses rs1 (base) and rs2 (src)
+            auto* i = (const Cat1Instruction*)ins;
+            if (OPCODES_1[i->bits.opcode.to_string()] == "sw") {
+                S.insert((int)i->bits.rs1.to_ulong());
+                S.insert((int)i->bits.rs2.to_ulong());
+            }
+            break;
+        }
+        case Instruction::Category::CAT2: {
+            auto* i = (const Cat2Instruction*)ins;
+            S.insert((int)i->bits.rs1.to_ulong());
+            S.insert((int)i->bits.rs2.to_ulong());
+            break;
+        }
+        case Instruction::Category::CAT3: {
+            auto* i = (const Cat3Instruction*)ins;
+            const string m = OPCODES_3[i->bits.opcode.to_string()];
+            // all CAT3 read rs1
+            S.insert((int)i->bits.rs1.to_ulong());
+            break;
+        }
+        default: break;
+    }
+}
+
+static bool isStore(const Instruction* ins) {
+    if (ins->category() != Instruction::Category::CAT1) return false;
+    auto* i = (const Cat1Instruction*)ins;
+    return OPCODES_1[i->bits.opcode.to_string()] == "sw";
+}
+
+static bool isLoad(const Instruction* ins) {
+    if (ins->category() != Instruction::Category::CAT3) return false;
+    auto* i = (const Cat3Instruction*)ins;
+    return OPCODES_3[i->bits.opcode.to_string()] == "lw";
+}
+
+static bool isALU2Arith(const Instruction* ins) {
+    if (ins->category() == Instruction::Category::CAT2) {
+        auto* i = (const Cat2Instruction*)ins;
+        auto m = OPCODES_2[i->bits.opcode.to_string()];
+        return (m == "add" || m == "sub");
+    }
+    if (ins->category() == Instruction::Category::CAT3) {
+        auto* i = (const Cat3Instruction*)ins;
+        auto m = OPCODES_3[i->bits.opcode.to_string()];
+        return (m == "addi");
+    }
+    return false;
+}
+static bool isALU3Logic(const Instruction* ins) {
+    if (ins->category() == Instruction::Category::CAT2) {
+        auto* i = (const Cat2Instruction*)ins;
+        auto m = OPCODES_2[i->bits.opcode.to_string()];
+        return (m == "and" || m == "or");
+    }
+    if (ins->category() == Instruction::Category::CAT3) {
+        auto* i = (const Cat3Instruction*)ins;
+        auto m = OPCODES_3[i->bits.opcode.to_string()];
+        return (m == "andi" || m == "ori" || m == "slli" || m == "srai");
+    }
+    return false;
+}
+
+static HazSnapshot buildHazSnapshot() {
+    auto& P = Program::instance();
+    HazSnapshot H{};
+
+    auto scanQ = [&](auto const& q) {
+        for (auto const& up : q) {
+            const Instruction* ins = up.get();
+            int rd = getDestReg(ins);
+            if (rd >= 0) H.activeDests.insert(rd);
+            addSources(ins, H.activeSources);
+            if (isStore(ins)) H.olderStorePending = true;
+        }
+    };
+    auto scanPairQ = [&](auto const& q) {
+        for (auto const& pr : q) {
+            const Instruction* ins = pr.first.get();
+            int rd = getDestReg(ins);
+            if (rd >= 0) H.activeDests.insert(rd);
+            addSources(ins, H.activeSources);
+            if (isStore(ins)) H.olderStorePending = true;
+        }
+    };
+
+    // everything except Pre-Issue (those are "not issued yet"; handled separately)
+    scanQ(P.preALU1Queue);
+    scanQ(P.preALU2Queue);
+    scanQ(P.preALU3Queue);
+
+    scanPairQ(P.preMemQueue);
+    scanPairQ(P.postMemQueue);
+    scanPairQ(P.postALU2Queue);
+    scanPairQ(P.postALU3Queue);
+
+    return H;
+}
+
+
 // ------------- Functional Units -------------
 
-void IF(){
-    auto &instruction = Program::instance().getInstructions();
-    auto &registers = Program::instance().getRegisters();
-    auto &registerState= Program::instance().getRegisterRoles();
-    auto &memory = Program::instance().getMemory();
+void IF() {
+    auto &prog          = Program::instance();
+    auto &instructions  = prog.getInstructions();
+    auto &registers     = prog.getRegisters();
+    auto &regState      = prog.getRegisterRoles();
 
-    int i = 0;
-    while (i < 2) {
-        int programCounter = Program::instance().getPC();
-        switch ((instruction[(programCounter - 256) / 4]).get()->category()) {
-            case Instruction::Category::CAT1: {
-                auto cat1 = (Cat1Instruction *) (instruction[(programCounter - 256) / 4]).get();
-                int rs1 = (int) cat1->bits.rs1.to_ulong();
-                int rs2 = (int) cat1->bits.rs2.to_ulong();
-                bitset<12> mem = bitset<12>(cat1->bits.imm115.to_string() + cat1->bits.imm40.to_string());
+    auto cloneInstruction = [](const Instruction* ins) -> std::unique_ptr<Instruction> {
+        switch (ins->category()) {
+            case Instruction::Category::CAT1:
+                return std::make_unique<Cat1Instruction>(*static_cast<const Cat1Instruction*>(ins));
+            case Instruction::Category::CAT2:
+                return std::make_unique<Cat2Instruction>(*static_cast<const Cat2Instruction*>(ins));
+            case Instruction::Category::CAT3:
+                return std::make_unique<Cat3Instruction>(*static_cast<const Cat3Instruction*>(ins));
+            case Instruction::Category::CAT4:
+                return std::make_unique<Cat4Instruction>(*static_cast<const Cat4Instruction*>(ins));
+            default:
+                return nullptr;
+        }
+    };
 
-                if (OPCODES_1[cat1->bits.opcode.to_string()] == "beq" or
-                    OPCODES_1[cat1->bits.opcode.to_string()] == "bne" or
-                    OPCODES_1[cat1->bits.opcode.to_string()] == "blt") {
-                    if (registerState[rs1] == FREE && registerState[rs2] == FREE) {
-                        if (OPCODES_1[cat1->bits.opcode.to_string()] == "beq") {
-                            if (registers[rs1] == registers[rs2]) {
-                                Program::instance().modifyPC((int) (mem.to_ulong() << 1));
-                            } else {
-                                Program::instance().modifyPC(4);
-                            }
-                        }
-                        else if (OPCODES_1[cat1->bits.opcode.to_string()] == "bne") {
-                            if (registers[rs1] != registers[rs2]) {
-                                Program::instance().modifyPC((int) (mem.to_ulong() << 1));
-                            } else {
-                                Program::instance().modifyPC(4);
-                            }
-                        }
-                        else if (OPCODES_1[cat1->bits.opcode.to_string()] == "blt") {
-                            if (registers[rs1] < registers[rs2]) {
-                                Program::instance().modifyPC((int) (mem.to_ulong() << 1));
-                            } else {
-                                Program::instance().modifyPC(4);
-                            }
-                        }
-                        Program::instance().setExecuted(cat1);
-                    }
-                    else{
-                        Program::instance().setWaiting(cat1);
-                        i = 2;
-                        break;
-                    }
-                }
-                else{
-                    if(Program::instance().preIssueQueue.size() + Program::instance().bufferedPreIssueQueue.size() < 4){
-                        Program::instance().bufferedPreIssueQueue.push_back(unique_ptr<Instruction>(cat1));
-                        Program::instance().modifyPC(4);
-                        registerState[rs1] = (registerState[rs1] == FREE) ? QUEUED : registerState[rs1];
-                        registerState[rs2] = (registerState[rs2] == FREE) ? QUEUED : registerState[rs1];
-                    }
-                    else{
-                        i = 2;
-                        break;
-                    }
-                }
-                break;
-            }
-            case Instruction::Category::CAT2: {
-                auto cat2 = (Cat2Instruction *) (instruction[(programCounter - 256) / 4]).get();
-                int rs1 = (int)cat2->bits.rs1.to_ulong();
-                int rs2 = (int)cat2->bits.rs2.to_ulong();
-                int rd =  (int)cat2->bits.rd.to_ulong();
-                if(Program::instance().preIssueQueue.size() + Program::instance().bufferedPreIssueQueue.size() < 4){
-                    Program::instance().bufferedPreIssueQueue.push_back(unique_ptr<Instruction>(cat2));
-                    Program::instance().modifyPC(4);
-                    registerState[rs1] = (registerState[rs1] == FREE) ? QUEUED : registerState[rs1];
-                    registerState[rs2] = (registerState[rs2] == FREE) ? QUEUED : registerState[rs1];
-                    registerState[rd] = (registerState[rd] == FREE) ? QUEUED : registerState[rs1];
-                }
-                else{
-                    i = 2;
-                    break;
-                }
-                break;
-            }
-            case Instruction::Category::CAT3: {
-                auto cat3 = (Cat3Instruction *) (instruction[(programCounter - 256) / 4]).get();
-                int rs1 = (int)cat3->bits.rs1.to_ulong();
-                int rd = (int)cat3->bits.rd.to_ulong();
-                if(Program::instance().preIssueQueue.size() + Program::instance().bufferedPreIssueQueue.size() < 4){
-                    Program::instance().bufferedPreIssueQueue.push_back(unique_ptr<Instruction>(cat3));
-                    Program::instance().modifyPC(4);
-                    registerState[rs1] = (registerState[rs1] == FREE) ? QUEUED : registerState[rs1];
-                    registerState[rd] = (registerState[rd] == FREE) ? QUEUED : registerState[rs1];
-                }
-                else{
-                    i = 2;
-                    break;
-                }
-                break;
-            }
-            case Instruction::Category::CAT4: {
+    auto markQueued = [&](int reg) {
+        if (reg >= 0 && reg < (int)regState.size() && regState[reg] == FREE) regState[reg] = QUEUED;
+    };
 
-                auto cat4 = (Cat4Instruction *) (instruction[(programCounter - 256) / 4]).get();
-                int rd =  (int)cat4->bits.rd.to_ulong();
-                if(OPCODES_4[cat4->bits.opcode.to_string()] == "break"){
-                    runningPipeline = false;
-                    break;
+    auto canFetchIntoPreIssue = [&](){
+        return (int)prog.preIssueQueue.size() + (int)prog.bufferedPreIssueQueue.size() < PREISSUEMAX;
+    };
+
+    // ---------- CYCLE-START: clear last cycle's Executed snapshot ----------
+    prog.setExecuted(nullptr);
+
+    // ---------- If something is already Waiting, try to execute it (or stall) ----------
+    if (prog.IFwaiting) {
+        const Instruction* w = prog.IFwaiting;
+
+        if (w->category() == Instruction::Category::CAT1) {
+            auto* br = (Cat1Instruction*)w;
+            int rs1 = (int)br->bits.rs1.to_ulong();
+            int rs2 = (int)br->bits.rs2.to_ulong();
+
+            std::string op = OPCODES_1[br->bits.opcode.to_string()];
+            if (op == "beq" || op == "bne" || op == "blt") {
+                // Branch executes in IF only when sources are FREE; otherwise stall.
+                if (regState[rs1] != FREE || regState[rs2] != FREE) {
+                    return; // keep it in Waiting; do NOT fetch
                 }
-                if(OPCODES_4[cat4->bits.opcode.to_string()] == "jal"){
-                    if (registerState[rd] == FREE) {
-                        Program::instance().modifyPC(singedImm((cat4->bits.imm190 << 1).to_ulong(), (cat4->bits.imm190 << 1).size()));
-                        Program::instance().instance().setExecuted(cat4);
-                    }
-                    else {
-                        Program::instance().instance().setWaiting(cat4);
-                    }
-                }
-                break;
+
+                // Resolve branch
+                std::bitset<12> imm(br->bits.imm115.to_string() + br->bits.imm40.to_string());
+                int offset = (int)( (int32_t)( (uint32_t)imm.to_ulong() << 20 ) >> 20 ) << 1; // sign-extend then <<1
+
+                bool take = false;
+                if (op == "beq") take = (registers[rs1] == registers[rs2]);
+                else if (op == "bne") take = (registers[rs1] != registers[rs2]);
+                else if (op == "blt") take = (registers[rs1] <  registers[rs2]);
+
+                if (take) prog.modifyPC(offset);
+                else      prog.modifyPC(4);
+
+                prog.setExecuted(w);
+                prog.setWaiting(nullptr);     // remove from Waiting now
+                // After executing a control flow, stop IF for this cycle.
+                return;
             }
         }
-        i++;
+        else if (w->category() == Instruction::Category::CAT4) {
+            auto* j = (Cat4Instruction*)w;
+            std::string op = OPCODES_4[j->bits.opcode.to_string()];
+            if (op == "jal") {
+                int rd = (int)j->bits.rd.to_ulong();
+                if (regState[rd] != FREE) {
+                    return; // stall until rd is FREE
+                }
+                int offset = singedImm((j->bits.imm190 << 1).to_ulong(), (int)(j->bits.imm190 << 1).size());
+                prog.modifyPC(offset);
+                prog.setExecuted(w);
+                prog.setWaiting(nullptr);
+                return;
+            }
+            // break should never be in Waiting; it ends in decode pass
+        }
+
+        // If Waiting holds a non-control (shouldn’t happen), just stop fetch to be safe.
+        return;
+    }
+
+    // ---------- No Waiting: we may fetch/decode up to two, unless we hit control ----------
+    int fetched = 0;
+    bool firstWasBranch = false;
+
+    auto fetchOne = [&]() -> Instruction* {
+        int pc  = prog.getPC();
+        int idx = (pc - 256) / 4;
+        if (idx < 0 || idx >= (int)instructions.size()) return nullptr;
+        return instructions[idx].get();
+    };
+
+    while (fetched < 2) {
+        if (!canFetchIntoPreIssue()) break;
+
+        Instruction* ins = fetchOne();
+        if (!ins) break;
+
+        switch (ins->category()) {
+            case Instruction::Category::CAT1: {
+                auto* c1 = (Cat1Instruction*)ins;
+                std::string op = OPCODES_1[c1->bits.opcode.to_string()];
+                bool is_branch = (op == "beq" || op == "bne" || op == "blt");
+
+                if (is_branch) {
+                    // Branch fetched now.
+                    if (fetched == 0) {
+                        // Branch is FIRST in the pair -> park in Waiting and DISCARD the second fetch this cycle.
+                        prog.setWaiting(c1);
+                        // Do NOT advance PC to the next-next instruction; branch’s outcome decides next PC.
+                        // We simply stop fetching now; the "next" instruction will be re-fetched later.
+                        fetched = 2;        // stop loop
+                        firstWasBranch = true;
+                    } else {
+                        // Branch is SECOND -> first instr already decoded; park branch, stop.
+                        prog.setWaiting(c1);
+                        // Same as above: we stop; next fetch will occur after branch outcome.
+                        fetched = 2;
+                    }
+                    break;
+                }
+
+                // Non-branch CAT1 (e.g., sw)
+                int rs1 = (int)c1->bits.rs1.to_ulong();
+                int rs2 = (int)c1->bits.rs2.to_ulong();
+                prog.bufferedPreIssueQueue.emplace_back(cloneInstruction(c1));
+                prog.modifyPC(4);
+                markQueued(rs1);
+                markQueued(rs2);
+                ++fetched;
+                break;
+            }
+
+            case Instruction::Category::CAT2: {
+                // Arithmetic/logical (R-type)
+                auto* c2 = (Cat2Instruction*)ins;
+                int rs1 = (int)c2->bits.rs1.to_ulong();
+                int rs2 = (int)c2->bits.rs2.to_ulong();
+                int rd  = (int)c2->bits.rd.to_ulong();
+                prog.bufferedPreIssueQueue.emplace_back(cloneInstruction(c2));
+                prog.modifyPC(4);
+                markQueued(rs1); markQueued(rs2); markQueued(rd);
+                ++fetched;
+                break;
+            }
+
+            case Instruction::Category::CAT3: {
+                // addi/andi/ori/slli/srai/lw
+                auto* c3 = (Cat3Instruction*)ins;
+                int rs1 = (int)c3->bits.rs1.to_ulong();
+                int rd  = (int)c3->bits.rd.to_ulong();
+                prog.bufferedPreIssueQueue.emplace_back(cloneInstruction(c3));
+                prog.modifyPC(4);
+                markQueued(rs1); markQueued(rd);
+                ++fetched;
+                break;
+            }
+
+            case Instruction::Category::CAT4: {
+                auto* c4 = (Cat4Instruction*)ins;
+                std::string op = OPCODES_4[c4->bits.opcode.to_string()];
+
+                if (op == "break") {
+                    runningPipeline = false;
+                    fetched = 2;
+                    break;
+                }
+
+                if (op == "jal") {
+                    // Park in Waiting first (per pairing rule)
+                    prog.setWaiting(c4);
+
+                    // If JAL is FIRST fetched this cycle, we must discard the second fetch and stop.
+                    if (fetched == 0) {
+                        fetched = 2;            // stop fetch loop
+                        break;                  // execute next cycle when ready
+                    }
+
+                    // JAL is SECOND fetched this cycle.
+                    // If rd is FREE, execute it immediately in this same cycle.
+                    int rd = (int)c4->bits.rd.to_ulong();
+                    if (regState[rd] == FREE) {
+                        int offset = singedImm((c4->bits.imm190 << 1).to_ulong(),
+                                               (int)(c4->bits.imm190 << 1).size());
+                        prog.modifyPC(offset);
+                        prog.setExecuted(c4);
+                        prog.setWaiting(nullptr);
+                    }
+                    fetched = 2;    // stop fetch loop either way
+                    break;
+                }
+
+                // Unknown CAT4
+                fetched = 2;
+                break;
+            }
+
+        }
     }
 }
 
 
-void Isssue(){
-    auto& registerState = Program::instance().getRegisterRoles();
-    for (int i = 0; i < Program::instance().preIssueQueue.size(); ++i) {
-        auto& inst = Program::instance().preIssueQueue[i];
-
-        switch (inst->category()) {
-        case Instruction::Category::CAT1: {
-            auto* cat1 = static_cast<Cat1Instruction*>(inst.get());
-            int rs1 = (int)cat1->bits.rs1.to_ulong();
-            int rs2 = (int)cat1->bits.rs2.to_ulong();
-
-            if (OPCODES_1[cat1->bits.opcode.to_string()] == "sw" &&
-                // Only need to check RAW here
-                (registerState[rs1] == FREE || registerState[rs1] == QUEUED || registerState[rs1] == DESTINATION) &&
-                (registerState[rs2] == FREE || registerState[rs2] == QUEUED || registerState[rs2] == DESTINATION)) {
 
 
-                // move ownership, erase by index, fix i
-                Program::instance().bufferedPreALU1Queue.push_back(std::move(Program::instance().preIssueQueue[i]));
-                Program::instance().preIssueQueue.erase(Program::instance().preIssueQueue.begin() + i);
-                --i;
+void Issue() {
+    auto& P = Program::instance();
 
-                registerState[rs1] = SOURCE;
-                registerState[rs2] = SOURCE;
-            }
-            break;
+    // Structural capacity snapshot (beginning-of-cycle)
+    bool alu1Free = (P.preALU1Queue.size() < PREALU1MAX);
+    bool alu2Free = (P.preALU2Queue.size() < PREALU2MAX);
+    bool alu3Free = (P.preALU3Queue.size() < PREALU3MAX);
+
+    int issuedTotal = 0;
+    bool usedALU1 = false, usedALU2 = false, usedALU3 = false;
+
+    // In-flight hazard snapshot (everything except preIssue)
+    HazSnapshot H = buildHazSnapshot();
+
+    // Track same-cycle hazards among instructions we issue this cycle
+    std::unordered_set<int> thisCycleDests, thisCycleSources;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // NEW: gate to block issuing past OLDER Pre-Issue entries with hazards
+    auto hazardsWithOlderPreIssue = [&](int myIndex, int myRD,
+                                        const std::unordered_set<int>& myRS) {
+        for (int j = 0; j < myIndex; ++j) {
+            const Instruction* older = P.preIssueQueue[j].get();
+            int olderRD = getDestReg(older);
+            std::unordered_set<int> olderRS;
+            addSources(older, olderRS);
+
+            // RAW: my rs vs older rd
+            for (int r : myRS) if (olderRD >= 0 && r == olderRD) return true;
+            // WAW: my rd vs older rd
+            if (myRD >= 0 && olderRD >= 0 && myRD == olderRD) return true;
+            // WAR: my rd vs older rs
+            if (myRD >= 0 && olderRS.count(myRD)) return true;
+        }
+        return false;
+    };
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // Scan Pre-Issue entries 0..3 (by index), max 3 issues total, ≤1/FU
+    for (int i = 0; i < (int)P.preIssueQueue.size() && issuedTotal < 3; ++i) {
+        Instruction* ins = P.preIssueQueue[i].get();
+
+        // Classify FU target
+        bool toALU1 = (isLoad(ins) || isStore(ins));
+        bool toALU2 = isALU2Arith(ins);
+        bool toALU3 = isALU3Logic(ins);
+
+        // Structural guard (beginning-of-cycle capacity + one per FU per cycle)
+        if (toALU1 && (!alu1Free || usedALU1)) continue;
+        if (toALU2 && (!alu2Free || usedALU2)) continue;
+        if (toALU3 && (!alu3Free || usedALU3)) continue;
+
+        // MEM ordering special rules
+        if (isStore(ins)) {
+            // stores issue in order: any older store still in Pre-Issue blocks me
+            bool olderStore = false;
+            for (int j = 0; j < i; ++j)
+                if (isStore(P.preIssueQueue[j].get())) { olderStore = true; break; }
+            if (olderStore) continue;
+        }
+        if (isLoad(ins)) {
+            // loads wait until all older stores (anywhere) are issued
+            bool olderStoreInPreIssue = false;
+            for (int j = 0; j < i; ++j)
+                if (isStore(P.preIssueQueue[j].get())) { olderStoreInPreIssue = true; break; }
+            if (olderStoreInPreIssue || H.olderStorePending) continue;
         }
 
-        case Instruction::Category::CAT2: {
-            auto* cat2 = static_cast<Cat2Instruction*>(inst.get());
-            int rs1 = (int)cat2->bits.rs1.to_ulong();
-            int rs2 = (int)cat2->bits.rs2.to_ulong();
-            int rd  = (int)cat2->bits.rd.to_ulong();
+        // Compute this instruction's sources/dest
+        std::unordered_set<int> rs;
+        addSources(ins, rs);
+        int rd = getDestReg(ins);
 
-            if ((OPCODES_2[cat2->bits.opcode.to_string()] == "add" ||
-                 OPCODES_2[cat2->bits.opcode.to_string()] == "sub") &&
-                (registerState[rs1] == FREE || registerState[rs1] == QUEUED || registerState[rs1] == DESTINATION) &&
-                (registerState[rs2] == FREE || registerState[rs2] == QUEUED || registerState[rs2] == DESTINATION) &&
-                (registerState[rd]  == FREE || registerState[rd]  == QUEUED) || registerState[rd] == DESTINATION) {
+        // ─────────────────────────────────────────────────────────────────────
+        // NEW: DO NOT bypass older Pre-Issue entries if there’s any reg hazard
+        if (hazardsWithOlderPreIssue(i, rd, rs)) continue;
+        // ─────────────────────────────────────────────────────────────────────
 
-                Program::instance().bufferedPreALU2Queue.push_back(std::move(Program::instance().preIssueQueue[i]));
-                Program::instance().preIssueQueue.erase(Program::instance().preIssueQueue.begin() + i);
-                --i;
+        // In-flight (already issued) hazards + same-cycle hazards
+        auto hasRAW = [&]{
+            for (int r : rs) if (H.activeDests.count(r) || thisCycleDests.count(r)) return true;
+            return false;
+        };
+        auto hasWAW = [&]{
+            if (rd < 0) return false;
+            return H.activeDests.count(rd) || thisCycleDests.count(rd);
+        };
+        auto hasWAR = [&]{
+            if (rd < 0) return false;
+            return H.activeSources.count(rd) || thisCycleSources.count(rd);
+        };
+        if (hasRAW() || hasWAW() || hasWAR()) continue;
 
-                registerState[rs1] = SOURCE;
-                registerState[rs2] = SOURCE;
-                registerState[rd]  = DESTINATION;
-            }
-            else if (OPCODES_2[cat2->bits.opcode.to_string()] == "or" &&
-                     (registerState[rs1] == FREE || registerState[rs1] == QUEUED) &&
-                     (registerState[rs2] == FREE || registerState[rs2] == QUEUED) &&
-                     (registerState[rd]  == FREE || registerState[rd]  == QUEUED)) {
-
-                Program::instance().bufferedPreALU3Queue.push_back(std::move(Program::instance().preIssueQueue[i]));
-                Program::instance().preIssueQueue.erase(Program::instance().preIssueQueue.begin() + i);
-                --i;
-
-                registerState[rs1] = SOURCE;
-                registerState[rs2] = SOURCE;
-                registerState[rd]  = DESTINATION;
-            }
-            break;
+        // Passed all checks → issue to FU buffer
+        if (toALU1) {
+            P.bufferedPreALU1Queue.push_back(std::move(P.preIssueQueue[i]));
+            usedALU1 = true;
+        } else if (toALU2) {
+            P.bufferedPreALU2Queue.push_back(std::move(P.preIssueQueue[i]));
+            usedALU2 = true;
+        } else if (toALU3) {
+            P.bufferedPreALU3Queue.push_back(std::move(P.preIssueQueue[i]));
+            usedALU3 = true;
+        } else {
+            continue; // non-issuable type (shouldn't happen)
         }
 
-        case Instruction::Category::CAT3: {
-            auto* cat3 = static_cast<Cat3Instruction*>(inst.get());
-            int rs1 = (int)cat3->bits.rs1.to_ulong();
-            int rd  = (int)cat3->bits.rd.to_ulong();
-            int imm = singedImm(cat3->bits.imm110.to_ulong(), cat3->bits.imm110.size());
+        // Remove from Pre-Issue; keep index in sync
+        P.preIssueQueue.erase(P.preIssueQueue.begin() + i);
+        --i;
 
-            if (OPCODES_3[cat3->bits.opcode.to_string()] == "addi" &&
-                (registerState[rs1] == FREE || registerState[rs1] == QUEUED) &&
-                (registerState[rd]  == FREE || registerState[rd]  == QUEUED)) {
+        // Book same-cycle hazards
+        for (int r : rs) thisCycleSources.insert(r);
+        if (rd >= 0) thisCycleDests.insert(rd);
 
-                Program::instance().bufferedPreALU2Queue.push_back(std::move(Program::instance().preIssueQueue[i]));
-                Program::instance().preIssueQueue.erase(Program::instance().preIssueQueue.begin() + i);
-                --i;
-
-                registerState[rs1] = SOURCE;
-                registerState[rd]  = DESTINATION;
-            }
-            else if ((OPCODES_3[cat3->bits.opcode.to_string()] == "andi" ||
-                      OPCODES_3[cat3->bits.opcode.to_string()] == "ori"  ||
-                      OPCODES_3[cat3->bits.opcode.to_string()] == "slli" ||
-                      OPCODES_3[cat3->bits.opcode.to_string()] == "srai") &&
-                     (registerState[rs1] == FREE || registerState[rs1] == QUEUED) &&
-                     (registerState[rd]  == FREE || registerState[rd]  == QUEUED)) {
-
-                Program::instance().bufferedPreALU3Queue.push_back(std::move(Program::instance().preIssueQueue[i]));
-                Program::instance().preIssueQueue.erase(Program::instance().preIssueQueue.begin() + i);
-                --i;
-
-                registerState[rs1] = SOURCE;
-                registerState[rd]  = DESTINATION;
-            }
-            else if (OPCODES_3[cat3->bits.opcode.to_string()] == "lw" &&
-                     (registerState[rs1] == FREE || registerState[rs1] == QUEUED) &&
-                     (registerState[rd]  == FREE || registerState[rd]  == QUEUED)) {
-
-                Program::instance().bufferedPreALU1Queue.push_back(std::move(Program::instance().preIssueQueue[i]));
-                Program::instance().preIssueQueue.erase(Program::instance().preIssueQueue.begin() + i);
-                --i;
-
-                registerState[rs1] = SOURCE;
-                registerState[rd]  = DESTINATION;
-            }
-            break;
-        }
-
-        case Instruction::Category::CAT4:
-            break;
-        }
+        ++issuedTotal;
     }
 }
 
@@ -707,14 +932,14 @@ void ALU1() {
             auto* cat1 = (Cat1Instruction*)inst;
             int rs1 = (int)cat1->bits.rs1.to_ulong();
             int rs2 = (int)cat1->bits.rs2.to_ulong();
-            std::bitset<12> mem( cat1->bits.imm115.to_string() + cat1->bits.imm40.to_string() );
+            bitset<12> mem( cat1->bits.imm115.to_string() + cat1->bits.imm40.to_string() );
 
             if (OPCODES_1[cat1->bits.opcode.to_string()] == "sw") {
                 int memToModify = (int)mem.to_ulong() + registers[rs2];
                 // move owning unique_ptr from preALU1Queue into pair<unique_ptr<Instruction>, int>
-                auto up = std::move(prog.preALU1Queue.front());
+                auto up = move(prog.preALU1Queue.front());
                 prog.preALU1Queue.pop_front();
-                prog.bufferedPreMemQueue.emplace_back(std::move(up), memToModify);
+                prog.bufferedPreMemQueue.emplace_back(move(up), memToModify);
             }
             break;
         }
@@ -726,9 +951,9 @@ void ALU1() {
 
             if (OPCODES_3[cat3->bits.opcode.to_string()] == "lw") {
                 int memToRead = imm + registers[rs1];
-                auto up = std::move(prog.preALU1Queue.front());
+                auto up = move(prog.preALU1Queue.front());
                 prog.preALU1Queue.pop_front();
-                prog.bufferedPreMemQueue.emplace_back(std::move(up), memToRead);
+                prog.bufferedPreMemQueue.emplace_back(move(up), memToRead);
             }
             break;
         }
@@ -756,9 +981,9 @@ void ALU2() {
                 result = registers[rs1] - registers[rs2];
             }
 
-            auto up = std::move(prog.preALU2Queue.front());
+            auto up = move(prog.preALU2Queue.front());
             prog.preALU2Queue.pop_front();
-            prog.bufferedPostALU2Queue.emplace_back(std::move(up), result);
+            prog.bufferedPostALU2Queue.emplace_back(move(up), result);
             break;
         }
 
@@ -769,10 +994,10 @@ void ALU2() {
 
             if (OPCODES_3[cat3->bits.opcode.to_string()] == "addi") {
                 int result = registers[rs1] + imm;
-                auto up = std::move(prog.preALU2Queue.front());
+                auto up = move(prog.preALU2Queue.front());
                 prog.preALU2Queue.pop_front();
                 // Your code used post ALU3 for addi; keeping that routing:
-                prog.bufferedPostALU3Queue.emplace_back(std::move(up), result);
+                prog.bufferedPostALU2Queue.emplace_back(move(up), result);
             }
             break;
         }
@@ -795,15 +1020,15 @@ void ALU3() {
             int result = 0;
 
             if (OPCODES_2[cat2->bits.opcode.to_string()] == "and") {
-                result = (int)(std::bitset<32>(registers[rs1]) & std::bitset<32>(registers[rs2])).to_ulong();
+                result = (int)(bitset<32>(registers[rs1]) & bitset<32>(registers[rs2])).to_ulong();
             } else if (OPCODES_2[cat2->bits.opcode.to_string()] == "or") {
-                result = (int)(std::bitset<32>(registers[rs1]) | std::bitset<32>(registers[rs2])).to_ulong();
+                result = (int)(bitset<32>(registers[rs1]) | bitset<32>(registers[rs2])).to_ulong();
             }
 
-            auto up = std::move(prog.preALU3Queue.front());
+            auto up = move(prog.preALU3Queue.front());
             prog.preALU3Queue.pop_front();
             // This should post to ALU3’s post queue, not ALU2
-            prog.bufferedPostALU3Queue.emplace_back(std::move(up), result);
+            prog.bufferedPostALU3Queue.emplace_back(move(up), result);
             break;
         }
 
@@ -814,18 +1039,18 @@ void ALU3() {
             int result = 0;
 
             if (OPCODES_3[cat3->bits.opcode.to_string()] == "andi") {
-                result = (int)(std::bitset<32>(registers[rs1]) & std::bitset<32>(imm)).to_ulong();
+                result = (int)(bitset<32>(registers[rs1]) & bitset<32>(imm)).to_ulong();
             } else if (OPCODES_3[cat3->bits.opcode.to_string()] == "ori") {
-                result = (int)(std::bitset<32>(registers[rs1]) | std::bitset<32>(imm)).to_ulong();
+                result = (int)(bitset<32>(registers[rs1]) | bitset<32>(imm)).to_ulong();
             } else if (OPCODES_3[cat3->bits.opcode.to_string()] == "slli") {
-                result = (int)(std::bitset<32>(registers[rs1]) << imm).to_ulong();
+                result = (int)(bitset<32>(registers[rs1]) << imm).to_ulong();
             } else if (OPCODES_3[cat3->bits.opcode.to_string()] == "srai") {
-                result = (int)(std::bitset<32>(registers[rs1]) >> imm).to_ulong();
+                result = (int)(bitset<32>(registers[rs1]) >> imm).to_ulong();
             }
 
-            auto up = std::move(prog.preALU3Queue.front());
+            auto up = move(prog.preALU3Queue.front());
             prog.preALU3Queue.pop_front();
-            prog.bufferedPostALU3Queue.emplace_back(std::move(up), result);
+            prog.bufferedPostALU3Queue.emplace_back(move(up), result);
             break;
         }
     }
@@ -863,9 +1088,9 @@ void MEM() {
             int memValue = (int)prog.getValueAtMem(addr).to_ulong();
 
             // Move the instruction unique_ptr along to Post-MEM with the loaded value
-            auto up = std::move(pairPtr->first);
+            auto up = move(pairPtr->first);
             prog.preMemQueue.pop_front();
-            prog.bufferedPostMemQueue.emplace_back(std::move(up), memValue);
+            prog.bufferedPostMemQueue.emplace_back(move(up), memValue);
             break;
         }
     }
@@ -960,7 +1185,7 @@ void WB() {
 template <typename T>
 void appendQueue(deque<T>& dest, deque<T>& src) {
     while (!src.empty()) {
-        dest.push_back(std::move(src.front()));
+        dest.push_back(move(src.front()));
         src.pop_front();
     }
 }
@@ -979,49 +1204,49 @@ void commitBufferedQueues() {
     appendQueue(prog.postALU3Queue,  prog.bufferedPostALU3Queue);
 }
 
-static std::string formatInst(const Instruction* ins) {
+static string formatInst(const Instruction* ins) {
     if (!ins) return "";
     switch (ins->category()) {
         case Instruction::Category::CAT1: {
             auto* i = (const Cat1Instruction*)ins;
-            const std::string m = OPCODES_1[i->bits.opcode.to_string()];
+            const string m = OPCODES_1[i->bits.opcode.to_string()];
             if (m == "sw") {
-                std::bitset<12> imm(i->bits.imm115.to_string() + i->bits.imm40.to_string());
-                return m + " x" + std::to_string(i->bits.rs1.to_ulong()) + ", "
-                     + std::to_string(imm.to_ulong()) + "(x" + std::to_string(i->bits.rs2.to_ulong()) + ")";
+                bitset<12> imm(i->bits.imm115.to_string() + i->bits.imm40.to_string());
+                return m + " x" + to_string(i->bits.rs1.to_ulong()) + ", "
+                     + to_string(imm.to_ulong()) + "(x" + to_string(i->bits.rs2.to_ulong()) + ")";
             } else {
-                std::bitset<12> imm(i->bits.imm115.to_string() + i->bits.imm40.to_string());
-                return m + " x" + std::to_string(i->bits.rs1.to_ulong()) + ", "
-                     + "x" + std::to_string(i->bits.rs2.to_ulong()) + ", "
-                     + "#" + std::to_string(singedImm(imm.to_ulong(), 12));
+                bitset<12> imm(i->bits.imm115.to_string() + i->bits.imm40.to_string());
+                return m + " x" + to_string(i->bits.rs1.to_ulong()) + ", "
+                     + "x" + to_string(i->bits.rs2.to_ulong()) + ", "
+                     + "#" + to_string(singedImm(imm.to_ulong(), 12));
             }
         }
         case Instruction::Category::CAT2: {
             auto* i = (const Cat2Instruction*)ins;
-            const std::string m = OPCODES_2[i->bits.opcode.to_string()];
-            return m + " x" + std::to_string(i->bits.rd.to_ulong()) + ", "
-                     + "x" + std::to_string(i->bits.rs1.to_ulong()) + ", "
-                     + "x" + std::to_string(i->bits.rs2.to_ulong());
+            const string m = OPCODES_2[i->bits.opcode.to_string()];
+            return m + " x" + to_string(i->bits.rd.to_ulong()) + ", "
+                     + "x" + to_string(i->bits.rs1.to_ulong()) + ", "
+                     + "x" + to_string(i->bits.rs2.to_ulong());
         }
         case Instruction::Category::CAT3: {
             auto* i = (const Cat3Instruction*)ins;
-            const std::string m = OPCODES_3[i->bits.opcode.to_string()];
+            const string m = OPCODES_3[i->bits.opcode.to_string()];
             if (m == "lw") {
-                return m + " x" + std::to_string(i->bits.rd.to_ulong()) + ", "
-                     + std::to_string(singedImm(i->bits.imm110.to_ulong(), 12)) + "(x"
-                     + std::to_string(i->bits.rs1.to_ulong()) + ")";
+                return m + " x" + to_string(i->bits.rd.to_ulong()) + ", "
+                     + to_string(singedImm(i->bits.imm110.to_ulong(), 12)) + "(x"
+                     + to_string(i->bits.rs1.to_ulong()) + ")";
             } else {
-                return m + " x" + std::to_string(i->bits.rd.to_ulong()) + ", "
-                     + "x" + std::to_string(i->bits.rs1.to_ulong()) + ", "
-                     + "#" + std::to_string(singedImm(i->bits.imm110.to_ulong(), 12));
+                return m + " x" + to_string(i->bits.rd.to_ulong()) + ", "
+                     + "x" + to_string(i->bits.rs1.to_ulong()) + ", "
+                     + "#" + to_string(singedImm(i->bits.imm110.to_ulong(), 12));
             }
         }
         case Instruction::Category::CAT4: {
             auto* i = (const Cat4Instruction*)ins;
-            const std::string m = OPCODES_4[i->bits.opcode.to_string()];
+            const string m = OPCODES_4[i->bits.opcode.to_string()];
             if (m == "jal") {
-                return m + " x" + std::to_string(i->bits.rd.to_ulong()) + ", "
-                     + "#" + std::to_string(singedImm(i->bits.imm190.to_ulong(), 20));
+                return m + " x" + to_string(i->bits.rd.to_ulong()) + ", "
+                     + "#" + to_string(singedImm(i->bits.imm190.to_ulong(), 20));
             } else {
                 return m; // break
             }
@@ -1030,83 +1255,124 @@ static std::string formatInst(const Instruction* ins) {
     return "";
 }
 
+
+static std::string bracket(const std::string& s) {
+    return s.empty() ? std::string{} : "[" + s + "]";
+}
+
+static std::string fmtBracket(const Instruction* ins) {
+    return bracket(formatInst(ins));
+}
+
+static std::ofstream simout;
+
+// IF unit
+static void printIFUnit() {
+    simout << "IF Unit:\n";
+    simout << "\tWaiting: "  << fmtBracket(Program::instance().IFwaiting)  << "\n";
+    simout << "\tExecuted: " << fmtBracket(Program::instance().IFexecuted) << "\n";
+}
+
+// Fixed-count entries (always print Entry lines) — used for Pre-Issue and Pre-ALU1
 template <typename Q>
-static void printInstrQueue(const char* title, const Q& q) {
-    std::cout << title << ":\n";
-    if (q.empty()) return;
+static void printFixedEntries(const char* title, const Q& q, int capacity) {
+    simout << title << ":\n";
     int idx = 0;
     for (auto const& up : q) {
-        const Instruction* ins = up.get();
-        std::cout << "\tEntry " << idx++ << ": " << formatInst(ins) << "\n";
+        if (idx >= capacity) break;
+        simout << "\tEntry " << idx++ << ": " << fmtBracket(up.get()) << "\n";
+    }
+    while (idx < capacity) {
+        simout << "\tEntry " << idx++ << ":\n";
     }
 }
 
+// When empty: print ONLY the header line (no "Entry 0:").
+// When non-empty: print up to `capacity` Entry lines.
+// Use this for Pre-ALU2 and Pre-ALU3 to match the target diff.
 template <typename Q>
-static void printPairQueue(const char* title, const Q& q) {
-    std::cout << title << ":\n";
-    if (q.empty()) return;
-    // Each entry is pair<unique_ptr<Instruction>, int>
-    for (auto const& pr : q) {
-        const Instruction* ins = pr.first.get();
-        std::cout << "\t" << formatInst(ins) << "  (val=" << pr.second << ")\n";
+static void printMaybeEntries(const char* title, const Q& q, int capacity) {
+    if (q.empty()) {
+        simout << title << ":\n";
+        return;
+    }
+    // non-empty → show entries (capacity lines max)
+    simout << title << ":\n";
+    int idx = 0;
+    for (auto const& up : q) {
+        if (idx >= capacity) break;
+        simout << "\tEntry " << idx++ << ": " << fmtBracket(up.get()) << "\n";
     }
 }
 
-static void printRegisters() {
+// Single-line queues that store pair<unique_ptr<Instruction>,T>
+// IMPORTANT: no trailing space after colon if empty
+template <typename Q>
+static void printSingleLineQueuePair(const char* title, const Q& q) {
+    simout << title << ":";
+    if (!q.empty()) {
+        simout << " " << fmtBracket(q.front().first.get());
+    }
+    simout << "\n";
+}
+
+// Single-line queues that store unique_ptr<Instruction>
+template <typename Q>
+static void printSingleLineQueue(const char* title, const Q& q) {
+    simout << title << ":";
+    if (!q.empty()) {
+        simout << " " << fmtBracket(q.front().get());
+    }
+    simout << "\n";
+}
+
+static void printRegistersStream() {
     auto& r = Program::instance().getRegisters();
-    std::cout << "\nRegisters\n";
+    simout << "\nRegisters\n";
     for (int base = 0; base < 32; base += 8) {
-        std::cout << "x" << (base < 10 ? "0" : "") << base << ":";
-        for (int i = 0; i < 8; ++i) std::cout << "\t" << r[base + i];
-        std::cout << "\n";
+        simout << "x" << (base < 10 ? "0" : "") << base << ":";
+        for (int i = 0; i < 8; ++i) simout << "\t" << r[base + i];
+        simout << "\n";
     }
 }
 
-static void printData() {
+static void printDataStream() {
     auto& mem = Program::instance().getMemory();
-    std::cout << "\nData\n";
+    simout << "\nData\n";
     for (int i = 0; i < (int)mem.size(); ++i) {
-        if (i % 8 == 0) std::cout << (memoryStart + i * 4) << ":";
-        std::cout << "\t" << singedImm(mem[i].second.to_ulong(), mem[i].second.size());
-        if (i % 8 == 7) std::cout << "\n";
+        if (i % 8 == 0) simout << (memoryStart + i * 4) << ":";
+        simout << "\t" << singedImm(mem[i].second.to_ulong(), mem[i].second.size());
+        if (i % 8 == 7) simout << "\n";
     }
-    if (!mem.empty() && mem.size() % 8 != 0) std::cout << "\n";
+    if (!mem.empty() && mem.size() % 8 != 0) simout << "\n";
 }
 
-static void printCycleState() {
-    std::cout << "--------------------\n";
-    std::cout << "Cycle " << Program::instance().getCycle() << ":\n\n";
 
-    // IF unit (best-effort — prints if you set these pointers elsewhere)
-    std::cout << "IF Unit:\n";
-    std::cout << "\tWaiting:  ";
-    if (Program::instance().IFwaiting)  std::cout << formatInst(Program::instance().IFwaiting);
-    std::cout << "\n\tExecuted: ";
-    if (Program::instance().IFexecuted) std::cout << formatInst(Program::instance().IFexecuted);
-    std::cout << "\n";
+static void printCycleStateStream() {
+    simout << "--------------------\n";
+    simout << "Cycle " << Program::instance().getCycle() << ":\n\n";
 
-    // Queues
-    printInstrQueue("Pre-Issue Queue", Program::instance().preIssueQueue);
+    printIFUnit();
 
-    // ALU1 side
-    printInstrQueue("Pre-ALU1 Queue", Program::instance().preALU1Queue);
-    printPairQueue ("Pre-MEM Queue",  Program::instance().preMemQueue);
-    printPairQueue ("Post-MEM Queue", Program::instance().postMemQueue);
+    printFixedEntries("Pre-Issue Queue", Program::instance().preIssueQueue, PREISSUEMAX);
 
-    // ALU2 side
-    printInstrQueue("Pre-ALU2 Queue", Program::instance().preALU2Queue);
-    printPairQueue ("Post-ALU2 Queue",Program::instance().postALU2Queue);
+    printFixedEntries("Pre-ALU1 Queue", Program::instance().preALU1Queue, PREALU1MAX);
+    printSingleLineQueuePair("Pre-MEM Queue",  Program::instance().preMemQueue);
+    printSingleLineQueuePair("Post-MEM Queue", Program::instance().postMemQueue);
 
-    // ALU3 side
-    printInstrQueue("Pre-ALU3 Queue", Program::instance().preALU3Queue);
-    printPairQueue ("Post-ALU3 Queue",Program::instance().postALU3Queue);
+    // ⬇️ use MaybeEntries so empty ALU2/ALU3 show only the header line
+    printMaybeEntries("Pre-ALU2 Queue", Program::instance().preALU2Queue, PREALU2MAX);
+    printSingleLineQueuePair("Post-ALU2 Queue", Program::instance().postALU2Queue);
 
-    // Registers + Data
-    printRegisters();
-    printData();
+    printMaybeEntries("Pre-ALU3 Queue", Program::instance().preALU3Queue, PREALU3MAX);
+    printSingleLineQueuePair("Post-ALU3 Queue", Program::instance().postALU3Queue);
 
-    std::cout << std::flush;
+    printRegistersStream();
+    printDataStream();
 }
+
+
+
 
 void runPipeLine(){
     int programCounter = 256;
@@ -1115,7 +1381,7 @@ void runPipeLine(){
     while(runningPipeline){
         IF();
         if (runningPipeline) {
-            Isssue();
+            Issue();
             ALU1();
             ALU2();
             ALU3();
@@ -1123,7 +1389,7 @@ void runPipeLine(){
             WB();
         }
         commitBufferedQueues();
-        printCycleState();
+        printCycleStateStream();
         Program::instance().incrementCycle(1);
     }
 }
@@ -1139,6 +1405,7 @@ int main(int argc, char* argv[]) {
     writeDisassembly();
     auto& tet = Program::instance().getInstQueue();
     runningPipeline = true;
+    simout.open("simulation.txt"); // <-- write here
     runPipeLine();
     file.close();
 
